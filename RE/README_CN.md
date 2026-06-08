@@ -1,4 +1,4 @@
-[English](main/README.md) | [简体中文](RE/README_CN.md) | [繁體中文](RE/README_TW.md) | [日本語](RE/README_JP.md)
+[English](github.com/candies-sven-007/Candies-Sing-Box/blob/main/README.md) | [简体中文](RE/README_CN.md) | [繁體中文](RE/README_TW.md) | [日本語](RE/README_JP.md)
 
 # Sing-box 多协议一键部署脚本
 
