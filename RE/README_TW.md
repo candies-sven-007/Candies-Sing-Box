@@ -1,5 +1,3 @@
-[English](main/README.md) | [简体中文](RE/README_CN.md) | [繁體中文](RE/README_TW.md) | [日本語](RE/README_JP.md)
-
 # Sing-box 多協議一鍵部署腳本
 
 一個強大的 Sing-box 自動化部署工具，支援 SS / HY2 / TUIC / VLESS Reality / AnyTLS Reality 協議自選部署和線路機 VLESS Reality 中轉的完整解決方案。
