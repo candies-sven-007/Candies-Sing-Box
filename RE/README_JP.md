@@ -1,5 +1,3 @@
-[English](main/README.md) | [简体中文](RE/README_CN.md) | [繁體中文](RE/README_TW.md) | [日本語](RE/README_JP.md)
-
 # Sing-box マルチプロトコル ワンクリックデプロイスクリプト
 
 SS / HY2 / TUIC / VLESS Reality / AnyTLS Reality プロトコルの自動デプロイと、リレーサーバーの VLESS Reality 中継に対応した強力な Sing-box 自動化ツールです。
