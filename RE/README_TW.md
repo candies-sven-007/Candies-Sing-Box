@@ -30,7 +30,7 @@
 ## ✅ 一鍵部署指令
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/candies-sven-007/proxy/main/install-multilingual.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/candies-sven-007/Candies-Sing-Box/refs/heads/main/install-multilingual.sh)
 ```
 
 ---
