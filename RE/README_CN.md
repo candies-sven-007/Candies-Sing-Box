@@ -1,5 +1,3 @@
-[English](github.com/candies-sven-007/Candies-Sing-Box/blob/main/README.md) | [简体中文](RE/README_CN.md) | [繁體中文](RE/README_TW.md) | [日本語](RE/README_JP.md)
-
 # Sing-box 多协议一键部署脚本
 
 一个强大的 Sing-box 自动化部署工具，支持 SS / HY2 / TUIC / VLESS Reality / AnyTLS Reality 协议自选部署和线路机 VLESS Reality 中转的完整解决方案。
