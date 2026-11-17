@@ -145,7 +145,9 @@ select_protocols() {
     ENABLE_TUIC=false
     ENABLE_REALITY=false
     ENABLE_ANYTLS=false
-    
+    ENABLE_VLESS_TLS=false
+    ENABLE_ANYTLS_TLS=false
+
     for num in $protocol_input; do
         case "$num" in
             1) ENABLE_SS=true ;;
@@ -156,12 +158,56 @@ select_protocols() {
             *) warn "无效选项: $num" ;;
         esac
     done
-    
+
     if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
         err "未选择任何协议,退出安装"
         exit 1
     fi
-    
+
+    # VLESS 变体选择（Reality / TLS）
+    if $ENABLE_REALITY; then
+        echo ""
+        echo "=== VLESS 变体（多个用空格分隔）==="
+        echo "1) Reality + Vision（推荐）"
+        echo "2) TLS（自签证书）"
+        echo "请选择（默认 1）:"
+        read -r vless_var
+        vless_var="${vless_var:-1}"
+        ENABLE_REALITY=false; ENABLE_VLESS_TLS=false
+        for v in $vless_var; do
+            case "$v" in
+                1) ENABLE_REALITY=true ;;
+                2) ENABLE_VLESS_TLS=true ;;
+                *) warn "无效选项: $v" ;;
+            esac
+        done
+        if ! $ENABLE_REALITY && ! $ENABLE_VLESS_TLS; then
+            ENABLE_REALITY=true
+        fi
+    fi
+
+    # AnyTLS 变体选择（Reality / TLS）
+    if $ENABLE_ANYTLS; then
+        echo ""
+        echo "=== AnyTLS 变体（多个用空格分隔）==="
+        echo "1) Reality（推荐）"
+        echo "2) TLS（自签证书）"
+        echo "请选择（默认 1）:"
+        read -r anytls_var
+        anytls_var="${anytls_var:-1}"
+        ENABLE_ANYTLS=false; ENABLE_ANYTLS_TLS=false
+        for v in $anytls_var; do
+            case "$v" in
+                1) ENABLE_ANYTLS=true ;;
+                2) ENABLE_ANYTLS_TLS=true ;;
+                *) warn "无效选项: $v" ;;
+            esac
+        done
+        if ! $ENABLE_ANYTLS && ! $ENABLE_ANYTLS_TLS; then
+            ENABLE_ANYTLS=true
+        fi
+    fi
+
     # 保存协议选择到文件（确保持久化）
     mkdir -p /etc/sing-box
     cat > /etc/sing-box/.protocols <<EOF
@@ -170,21 +216,27 @@ ENABLE_HY2=$ENABLE_HY2
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_REALITY=$ENABLE_REALITY
 ENABLE_ANYTLS=$ENABLE_ANYTLS
+ENABLE_VLESS_TLS=$ENABLE_VLESS_TLS
+ENABLE_ANYTLS_TLS=$ENABLE_ANYTLS_TLS
 EOF
-    
+
     info "已选择协议:"
     $ENABLE_SS && echo "  - Shadowsocks"
     $ENABLE_HY2 && echo "  - Hysteria2"
     $ENABLE_TUIC && echo "  - TUIC"
     $ENABLE_REALITY && echo "  - VLESS Reality"
+    $ENABLE_VLESS_TLS && echo "  - VLESS TLS"
     $ENABLE_ANYTLS && echo "  - AnyTLS Reality"
-    
+    $ENABLE_ANYTLS_TLS && echo "  - AnyTLS TLS"
+
     # 导出为全局变量（确保后续脚本可以访问）
     export ENABLE_SS
     export ENABLE_HY2
     export ENABLE_TUIC
     export ENABLE_REALITY
     export ENABLE_ANYTLS
+    export ENABLE_VLESS_TLS
+    export ENABLE_ANYTLS_TLS
 }
 
 # 创建配置目录
@@ -198,28 +250,89 @@ select_ss_method() {
         SS_METHOD="2022-blake3-aes-128-gcm"
         return 0
     fi
-    
+
     info "=== 选择 Shadowsocks 加密方式 ==="
     echo "1) 2022-blake3-aes-128-gcm (推荐)"
-    echo "2) aes-128-gcm"
+    echo "2) 2022-blake3-aes-256-gcm"
+    echo "3) aes-128-gcm"
+    echo "4) aes-256-gcm"
+    echo "5) chacha20-ietf-poly1305"
     echo ""
     echo "请输入选择(默认为 1):"
     read -r ss_method_choice
-    
+
     case "${ss_method_choice:-1}" in
         1) SS_METHOD="2022-blake3-aes-128-gcm" ;;
-        2) SS_METHOD="aes-128-gcm" ;;
-        *) 
+        2) SS_METHOD="2022-blake3-aes-256-gcm" ;;
+        3) SS_METHOD="aes-128-gcm" ;;
+        4) SS_METHOD="aes-256-gcm" ;;
+        5) SS_METHOD="chacha20-ietf-poly1305" ;;
+        *)
             warn "无效选择，使用默认方式: 2022-blake3-aes-128-gcm"
             SS_METHOD="2022-blake3-aes-128-gcm"
             ;;
     esac
-    
+
     info "已选择加密方式: $SS_METHOD"
     export SS_METHOD
 }
 
 select_ss_method
+
+# -----------------------
+# 选择 HY2 混淆（新增）
+select_hy2_obfs() {
+    HY2_OBFS="none"; HY2_OBFS_PSK=""
+    if ! $ENABLE_HY2; then
+        return 0
+    fi
+    info "=== 选择 Hysteria2 混淆 ==="
+    echo "1) 无混淆（推荐，兼容性最好）"
+    echo "2) salamander 混淆"
+    echo ""
+    echo "请输入选择(默认为 1):"
+    read -r hy2_obfs_choice
+    case "${hy2_obfs_choice:-1}" in
+        2)
+            HY2_OBFS="salamander"
+            HY2_OBFS_PSK=$(rand_pass)
+            info "已选择 salamander 混淆"
+            ;;
+        *) HY2_OBFS="none" ;;
+    esac
+    export HY2_OBFS HY2_OBFS_PSK
+}
+
+select_hy2_obfs
+
+# -----------------------
+# 选择 TUIC 拥塞控制（新增）
+select_tuic_cc() {
+    TUIC_CC="bbr"
+    if ! $ENABLE_TUIC; then
+        return 0
+    fi
+    info "=== 选择 TUIC 拥塞控制 ==="
+    echo "1) bbr（推荐）"
+    echo "2) cubic"
+    echo "3) new_reno"
+    echo ""
+    echo "请输入选择(默认为 1):"
+    read -r tuic_cc_choice
+    case "${tuic_cc_choice:-1}" in
+        1) TUIC_CC="bbr" ;;
+        2) TUIC_CC="cubic" ;;
+        3) TUIC_CC="new_reno" ;;
+        *)
+            warn "无效选择，使用默认: bbr"
+            TUIC_CC="bbr"
+            ;;
+    esac
+    info "已选择拥塞控制: $TUIC_CC"
+    export TUIC_CC
+}
+
+select_tuic_cc
 
 # -----------------------
 # 在获取公网 IP 之前，询问连接ip和sni配置
@@ -328,7 +441,16 @@ get_config() {
         info "VLESS Reality 端口: $PORT_REALITY"
         info "VLESS Reality UUID 已自动生成"
     fi
-    
+
+    if $ENABLE_VLESS_TLS; then
+        info "=== 配置 VLESS TLS ==="
+        read -p "请输入 VLESS TLS 端口(留空则随机 10000-60000): " USER_PORT_VLESS_TLS
+        PORT_VLESS_TLS="${USER_PORT_VLESS_TLS:-$(rand_port)}"
+        UUID_VLESS_TLS=$(rand_uuid)
+        info "VLESS TLS 端口: $PORT_VLESS_TLS"
+        info "VLESS TLS UUID 已自动生成"
+    fi
+
     if $ENABLE_ANYTLS; then
     info "=== 配置 AnyTLS Reality ==="
     if [ -n "${SINGBOX_PORT_ANYTLS:-}" ]; then
@@ -344,6 +466,17 @@ get_config() {
     info "AnyTLS Reality 端口: $PORT_ANYTLS"
     info "AnyTLS Reality 用户名: $ANYTLS_USER"
     info "AnyTLS Reality 密码已自动生成"
+    fi
+
+    if $ENABLE_ANYTLS_TLS; then
+        info "=== 配置 AnyTLS TLS ==="
+        read -p "请输入 AnyTLS TLS 端口(留空则随机 10000-60000): " USER_PORT_ANYTLS_TLS
+        PORT_ANYTLS_TLS="${USER_PORT_ANYTLS_TLS:-$(rand_port)}"
+        ANYTLS_TLS_USER=$(openssl rand -hex 4)
+        ANYTLS_TLS_PSK=$(openssl rand -base64 16)
+        info "AnyTLS TLS 端口: $PORT_ANYTLS_TLS"
+        info "AnyTLS TLS 用户名: $ANYTLS_TLS_USER"
+        info "AnyTLS TLS 密码已自动生成"
     fi
 
     info "配置完成，继续安装..."
@@ -442,12 +575,12 @@ generate_reality_keys
 # -----------------------
 # 生成 HY2/TUIC 自签证书(仅在需要时)
 generate_cert() {
-    if ! $ENABLE_HY2 && ! $ENABLE_TUIC; then
-        info "跳过证书生成(未选择 HY2 或 TUIC)"
+    if ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_VLESS_TLS && ! $ENABLE_ANYTLS_TLS; then
+        info "跳过证书生成(未选择 HY2、TUIC 或 TLS 变体)"
         return 0
     fi
-    
-    info "生成 HY2/TUIC 自签证书..."
+
+    info "生成 HY2/TUIC/TLS 自签证书..."
     mkdir -p /etc/sing-box/certs
     
     if [ ! -f /etc/sing-box/certs/fullchain.pem ] || [ ! -f /etc/sing-box/certs/privkey.pem ]; then
@@ -512,6 +645,7 @@ INBOUND_SS
           "password": "PSK_HY2_PLACEHOLDER"
         }
       ],
+OBFS_HY2_PLACEHOLDER
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -522,9 +656,14 @@ INBOUND_SS
 INBOUND_HY2
         sed -i "s|PORT_HY2_PLACEHOLDER|$PORT_HY2|g" "$TEMP_INBOUNDS"
         sed -i "s|PSK_HY2_PLACEHOLDER|$PSK_HY2|g" "$TEMP_INBOUNDS"
+        if [ "${HY2_OBFS:-none}" = "salamander" ]; then
+            sed -i "s|OBFS_HY2_PLACEHOLDER|      \"obfs\": {\"type\": \"salamander\", \"password\": \"$HY2_OBFS_PSK\"},|" "$TEMP_INBOUNDS"
+        else
+            sed -i "/OBFS_HY2_PLACEHOLDER/d" "$TEMP_INBOUNDS"
+        fi
         need_comma=true
     fi
-    
+
     if $ENABLE_TUIC; then
         $need_comma && echo "," >> "$TEMP_INBOUNDS"
         cat >> "$TEMP_INBOUNDS" <<'INBOUND_TUIC'
@@ -539,7 +678,7 @@ INBOUND_HY2
           "password": "PSK_TUIC_PLACEHOLDER"
         }
       ],
-      "congestion_control": "bbr",
+      "congestion_control": "TUIC_CC_PLACEHOLDER",
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -551,6 +690,7 @@ INBOUND_TUIC
         sed -i "s|PORT_TUIC_PLACEHOLDER|$PORT_TUIC|g" "$TEMP_INBOUNDS"
         sed -i "s|UUID_TUIC_PLACEHOLDER|$UUID_TUIC|g" "$TEMP_INBOUNDS"
         sed -i "s|PSK_TUIC_PLACEHOLDER|$PSK_TUIC|g" "$TEMP_INBOUNDS"
+        sed -i "s|TUIC_CC_PLACEHOLDER|${TUIC_CC:-bbr}|g" "$TEMP_INBOUNDS"
         need_comma=true
     fi
     
@@ -591,6 +731,33 @@ INBOUND_REALITY
         need_comma=true
     fi
 
+    if $ENABLE_VLESS_TLS; then
+        $need_comma && echo "," >> "$TEMP_INBOUNDS"
+        cat >> "$TEMP_INBOUNDS" <<'INBOUND_VLESS_TLS'
+    {
+      "type": "vless",
+      "tag": "vless-tls-in",
+      "listen": "::",
+      "listen_port": PORT_VLESS_TLS_PLACEHOLDER,
+      "users": [
+        {
+          "uuid": "UUID_VLESS_TLS_PLACEHOLDER"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.bing.com",
+        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
+        "key_path": "/etc/sing-box/certs/privkey.pem"
+      }
+    }
+INBOUND_VLESS_TLS
+        sed -i "s|PORT_VLESS_TLS_PLACEHOLDER|$PORT_VLESS_TLS|g" "$TEMP_INBOUNDS"
+        sed -i "s|UUID_VLESS_TLS_PLACEHOLDER|$UUID_VLESS_TLS|g" "$TEMP_INBOUNDS"
+        need_comma=true
+    fi
+
+
     if $ENABLE_ANYTLS; then
     $need_comma && echo "," >> "$TEMP_INBOUNDS"
     cat >> "$TEMP_INBOUNDS" <<'INBOUND_ANYTLS'
@@ -630,6 +797,37 @@ INBOUND_ANYTLS
     sed -i "s|REALITY_PK_PLACEHOLDER|$REALITY_PK|g" "$TEMP_INBOUNDS"
     sed -i "s|REALITY_SID_PLACEHOLDER|$REALITY_SID|g" "$TEMP_INBOUNDS"
     sed -i "s|REALITY_SNI_PLACEHOLDER|$REALITY_SNI|g" "$TEMP_INBOUNDS"
+
+    need_comma=true
+    fi
+
+    if $ENABLE_ANYTLS_TLS; then
+    $need_comma && echo "," >> "$TEMP_INBOUNDS"
+    cat >> "$TEMP_INBOUNDS" <<'INBOUND_ANYTLS_TLS'
+    {
+      "type": "anytls",
+      "tag": "anytls-tls-in",
+      "listen": "::",
+      "listen_port": PORT_ANYTLS_TLS_PLACEHOLDER,
+      "users": [
+        {
+          "name": "ANYTLS_TLS_USER_PLACEHOLDER",
+          "password": "ANYTLS_TLS_PSK_PLACEHOLDER"
+        }
+      ],
+      "padding_scheme": [],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.bing.com",
+        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
+        "key_path": "/etc/sing-box/certs/privkey.pem"
+      }
+    }
+INBOUND_ANYTLS_TLS
+
+    sed -i "s|PORT_ANYTLS_TLS_PLACEHOLDER|$PORT_ANYTLS_TLS|g" "$TEMP_INBOUNDS"
+    sed -i "s|ANYTLS_TLS_USER_PLACEHOLDER|$ANYTLS_TLS_USER|g" "$TEMP_INBOUNDS"
+    sed -i "s|ANYTLS_TLS_PSK_PLACEHOLDER|$ANYTLS_TLS_PSK|g" "$TEMP_INBOUNDS"
 
     need_comma=true
     fi
@@ -676,6 +874,8 @@ ENABLE_HY2=$ENABLE_HY2
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_REALITY=$ENABLE_REALITY
 ENABLE_ANYTLS=$ENABLE_ANYTLS
+ENABLE_VLESS_TLS=$ENABLE_VLESS_TLS
+ENABLE_ANYTLS_TLS=$ENABLE_ANYTLS_TLS
 CACHEEOF
 
     $ENABLE_SS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
@@ -687,12 +887,15 @@ CACHEEOF
     $ENABLE_HY2 && cat >> /etc/sing-box/.config_cache <<CACHEEOF
 HY2_PORT=$PORT_HY2
 HY2_PSK=$PSK_HY2
+HY2_OBFS=$HY2_OBFS
+HY2_OBFS_PSK=$HY2_OBFS_PSK
 CACHEEOF
 
     $ENABLE_TUIC && cat >> /etc/sing-box/.config_cache <<CACHEEOF
 TUIC_PORT=$PORT_TUIC
 TUIC_UUID=$UUID_TUIC
 TUIC_PSK=$PSK_TUIC
+TUIC_CC=$TUIC_CC
 CACHEEOF
 
     $ENABLE_REALITY && cat >> /etc/sing-box/.config_cache <<CACHEEOF
@@ -704,10 +907,21 @@ REALITY_PUB=$REALITY_PUB
 REALITY_SNI=$REALITY_SNI
 CACHEEOF
 
+    $ENABLE_VLESS_TLS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
+VLESS_TLS_PORT=$PORT_VLESS_TLS
+VLESS_TLS_UUID=$UUID_VLESS_TLS
+CACHEEOF
+
     $ENABLE_ANYTLS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
 ANYTLS_PORT=$PORT_ANYTLS
 ANYTLS_USER=$ANYTLS_USER
 ANYTLS_PSK=$ANYTLS_PSK
+CACHEEOF
+
+    $ENABLE_ANYTLS_TLS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
+ANYTLS_TLS_PORT=$PORT_ANYTLS_TLS
+ANYTLS_TLS_USER=$ANYTLS_TLS_USER
+ANYTLS_TLS_PSK=$ANYTLS_TLS_PSK
 CACHEEOF
 
     # 全局写入 CUSTOM_IP（哪怕为空也写）
@@ -1008,41 +1222,48 @@ read_config() {
         err "未找到配置文件: $CONFIG_PATH"
         return 1
     fi
-    
+
     # 优先加载 .protocols 文件（确认协议标记）
     PROTOCOL_FILE="/etc/sing-box/.protocols"
     if [ -f "$PROTOCOL_FILE" ]; then
         . "$PROTOCOL_FILE"
     fi
-    
+
     # 加载缓存文件（包含端口密码等详细配置）
     if [ -f "$CACHE_FILE" ]; then
         . "$CACHE_FILE"
     fi
-    
-    # 确保有默认值
+
+    # 确保有默认值（新变体开关默认 false，保持旧配置兼容）
     REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
     ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
+    ENABLE_VLESS_TLS="${ENABLE_VLESS_TLS:-false}"
+    ENABLE_ANYTLS_TLS="${ENABLE_ANYTLS_TLS:-false}"
     CUSTOM_IP="${CUSTOM_IP:-}"
+    HY2_OBFS="${HY2_OBFS:-none}"
+    TUIC_CC="${TUIC_CC:-bbr}"
 
-    # 读取各协议配置
+    # 读取各协议配置（按 tag 读，同一类型多个变体时互不干扰）
     if [ "${ENABLE_SS:-false}" = "true" ]; then
-        SS_PORT=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        SS_PSK=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .password // empty' "$CONFIG_PATH" | head -n1)
-        SS_METHOD=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .method // empty' "$CONFIG_PATH" | head -n1)
+        SS_PORT=$(jq -r '.inbounds[] | select(.tag=="ss-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        SS_PSK=$(jq -r '.inbounds[] | select(.tag=="ss-in") | .password // empty' "$CONFIG_PATH" | head -n1)
+        SS_METHOD=$(jq -r '.inbounds[] | select(.tag=="ss-in") | .method // empty' "$CONFIG_PATH" | head -n1)
     fi
-    
+
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        HY2_PORT=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        HY2_PSK=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+        HY2_PORT=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        HY2_PSK=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+        HY2_OBFS=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .obfs.type // "none"' "$CONFIG_PATH" | head -n1)
+        HY2_OBFS_PSK=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .obfs.password // empty' "$CONFIG_PATH" | head -n1)
     fi
-    
+
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        TUIC_PORT=$(jq -r '.inbounds[] | select(.type=="tuic") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        TUIC_UUID=$(jq -r '.inbounds[] | select(.type=="tuic") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-        TUIC_PSK=$(jq -r '.inbounds[] | select(.type=="tuic") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+        TUIC_PORT=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+        TUIC_UUID=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+        TUIC_PSK=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+        TUIC_CC=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .congestion_control // "bbr"' "$CONFIG_PATH" | head -n1)
     fi
-    
+
 # Reality 公共参数（Reality / AnyTLS 共用）
 if [ "${ENABLE_REALITY:-false}" = "true" ] || [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
     REALITY_SID=$(jq -r '
@@ -1056,17 +1277,29 @@ fi
 
 # VLESS Reality 专属参数
 if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-    REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-
-    REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-
-    REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_PORT=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_UUID=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+    REALITY_PK=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
 fi
 
+# VLESS TLS 专属参数
+if [ "${ENABLE_VLESS_TLS:-false}" = "true" ]; then
+    VLESS_TLS_PORT=$(jq -r '.inbounds[] | select(.tag=="vless-tls-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    VLESS_TLS_UUID=$(jq -r '.inbounds[] | select(.tag=="vless-tls-in") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
+fi
+
+
 if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
-    ANYTLS_PORT=$(jq -r '.inbounds[] | select(.type=="anytls") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-    ANYTLS_USER=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
-    ANYTLS_PSK=$(jq -r '.inbounds[] | select(.type=="anytls") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_PORT=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_USER=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_PSK=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
+fi
+
+# AnyTLS TLS 专属参数
+if [ "${ENABLE_ANYTLS_TLS:-false}" = "true" ]; then
+    ANYTLS_TLS_PORT=$(jq -r '.inbounds[] | select(.tag=="anytls-tls-in") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_TLS_USER=$(jq -r '.inbounds[] | select(.tag=="anytls-tls-in") | .users[0].name // empty' "$CONFIG_PATH" | head -n1)
+    ANYTLS_TLS_PSK=$(jq -r '.inbounds[] | select(.tag=="anytls-tls-in") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
 fi
 }
 
@@ -1110,29 +1343,49 @@ generate_uris() {
     if [ "${ENABLE_HY2:-false}" = "true" ]; then
         hy2_encoded=$(url_encode "$HY2_PSK")
         echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
-        echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
+        if [ "${HY2_OBFS:-none}" = "salamander" ] && [ -n "${HY2_OBFS_PSK:-}" ]; then
+            hy2_obfs_encoded=$(url_encode "$HY2_OBFS_PSK")
+            echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1&obfs=salamander&obfs-password=${hy2_obfs_encoded}#hy2${node_suffix}" >> "$URI_FILE"
+        else
+            echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
+        fi
         echo "" >> "$URI_FILE"
     fi
-    
+
     if [ "${ENABLE_TUIC:-false}" = "true" ]; then
         tuic_encoded=$(url_encode "$TUIC_PSK")
         echo "=== TUIC ===" >> "$URI_FILE"
-        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORT}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${node_suffix}" >> "$URI_FILE"
+        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORT}/?congestion_control=${TUIC_CC:-bbr}&alpn=h3&sni=www.bing.com&insecure=1#tuic${node_suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
-    
+
     if [ "${ENABLE_REALITY:-false}" = "true" ]; then
         REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
         echo "=== VLESS Reality ===" >> "$URI_FILE"
         echo "vless://${REALITY_UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${node_suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
-    
+
+    if [ "${ENABLE_VLESS_TLS:-false}" = "true" ]; then
+        echo "=== VLESS TLS ===" >> "$URI_FILE"
+        echo "vless://${VLESS_TLS_UUID}@${PUBLIC_IP}:${VLESS_TLS_PORT}?encryption=none&security=tls&sni=www.bing.com&fp=chrome&allowInsecure=1#vless-tls${node_suffix}" >> "$URI_FILE"
+        echo "" >> "$URI_FILE"
+    fi
+
+
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
         anytls_user_encoded=$(url_encode "$ANYTLS_USER")
         anytls_pass_encoded=$(url_encode "$ANYTLS_PSK")
         echo "=== AnyTLS Reality ===" >> "$URI_FILE"
         echo "anytls://${anytls_pass_encoded}@${PUBLIC_IP}:${ANYTLS_PORT}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${node_suffix}" >> "$URI_FILE"
+        echo "" >> "$URI_FILE"
+    fi
+
+    if [ "${ENABLE_ANYTLS_TLS:-false}" = "true" ]; then
+        anytls_tls_user_encoded=$(url_encode "$ANYTLS_TLS_USER")
+        anytls_tls_pass_encoded=$(url_encode "$ANYTLS_TLS_PSK")
+        echo "=== AnyTLS TLS ===" >> "$URI_FILE"
+        echo "anytls://${anytls_tls_user_encoded}:${anytls_tls_pass_encoded}@${PUBLIC_IP}:${ANYTLS_TLS_PORT}/?security=tls&sni=www.bing.com&fp=chrome&allowInsecure=1#anytls-tls${node_suffix}" >> "$URI_FILE"
         echo "" >> "$URI_FILE"
     fi
 
@@ -1247,7 +1500,7 @@ ensure_reality_keys() {
 # 更新 .config_cache 里的协议开关（read_config 先读 .protocols 再读缓存，两个都要改）
 update_cache_flags() {
     local key val
-    for key in ENABLE_SS ENABLE_HY2 ENABLE_TUIC ENABLE_REALITY ENABLE_ANYTLS; do
+    for key in ENABLE_SS ENABLE_HY2 ENABLE_TUIC ENABLE_REALITY ENABLE_ANYTLS ENABLE_VLESS_TLS ENABLE_ANYTLS_TLS; do
         val="${!key:-false}"
         if grep -q "^${key}=" "$CACHE_FILE" 2>/dev/null; then
             sed -i "s|^${key}=.*|${key}=${val}|" "$CACHE_FILE"
@@ -1257,7 +1510,7 @@ update_cache_flags() {
     done
 }
 
-# 添加新协议（不重装、不动已有节点）
+# 添加新协议（不重装、不动已有节点；选协议后再选变体）
 action_add_protocol() {
     read_config || return 1
 
@@ -1270,30 +1523,67 @@ action_add_protocol() {
     echo "1) Shadowsocks (SS)   [ $([ "${ENABLE_SS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
     echo "2) Hysteria2 (HY2)   [ $([ "${ENABLE_HY2:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
     echo "3) TUIC              [ $([ "${ENABLE_TUIC:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
-    echo "4) VLESS Reality     [ $([ "${ENABLE_REALITY:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
-    echo "5) AnyTLS Reality    [ $([ "${ENABLE_ANYTLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo "4) VLESS             [ Reality:$([ "${ENABLE_REALITY:-false}" = "true" ] && echo 已安装 || echo 未安装) TLS:$([ "${ENABLE_VLESS_TLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo "5) AnyTLS            [ Reality:$([ "${ENABLE_ANYTLS:-false}" = "true" ] && echo 已安装 || echo 未安装) TLS:$([ "${ENABLE_ANYTLS_TLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
     echo ""
     echo "请输入要添加的协议编号(多个用空格分隔,如: 1 3,回车取消):"
     read -r add_input
     [ -z "${add_input:-}" ] && { info "已取消"; return 0; }
 
-    local to_add="" n
+    # 变体键：ss / hy2 / tuic / vless-reality / vless-tls / anytls-reality / anytls-tls
+    local to_add="" n v
     for n in $add_input; do
         case "$n" in
-            1) [ "${ENABLE_SS:-false}" = "true" ] && warn "SS 已安装,跳过" || to_add="$to_add 1" ;;
-            2) [ "${ENABLE_HY2:-false}" = "true" ] && warn "HY2 已安装,跳过" || to_add="$to_add 2" ;;
-            3) [ "${ENABLE_TUIC:-false}" = "true" ] && warn "TUIC 已安装,跳过" || to_add="$to_add 3" ;;
-            4) [ "${ENABLE_REALITY:-false}" = "true" ] && warn "VLESS Reality 已安装,跳过" || to_add="$to_add 4" ;;
-            5) [ "${ENABLE_ANYTLS:-false}" = "true" ] && warn "AnyTLS Reality 已安装,跳过" || to_add="$to_add 5" ;;
+            1)
+                [ "${ENABLE_SS:-false}" = "true" ] && warn "SS 已安装,跳过" || to_add="$to_add ss"
+                ;;
+            2)
+                [ "${ENABLE_HY2:-false}" = "true" ] && warn "HY2 已安装,跳过" || to_add="$to_add hy2"
+                ;;
+            3)
+                [ "${ENABLE_TUIC:-false}" = "true" ] && warn "TUIC 已安装,跳过" || to_add="$to_add tuic"
+                ;;
+            4)
+                echo "--- VLESS 变体（多个用空格分隔）---"
+                echo "1) Reality + Vision（推荐）  [ $([ "${ENABLE_REALITY:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+                echo "2) TLS（自签证书）          [ $([ "${ENABLE_VLESS_TLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+                echo "请选择（默认 1，回车跳过）:"
+                read -r v
+                [ -z "${v:-}" ] && continue
+                for v in $v; do
+                    case "$v" in
+                        1) [ "${ENABLE_REALITY:-false}" = "true" ] && warn "VLESS Reality 已安装,跳过" || to_add="$to_add vless-reality" ;;
+                        2) [ "${ENABLE_VLESS_TLS:-false}" = "true" ] && warn "VLESS TLS 已安装,跳过" || to_add="$to_add vless-tls" ;;
+                        *) warn "无效选项: $v" ;;
+                    esac
+                done
+                ;;
+            5)
+                echo "--- AnyTLS 变体（多个用空格分隔）---"
+                echo "1) Reality（推荐）  [ $([ "${ENABLE_ANYTLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+                echo "2) TLS（自签证书）  [ $([ "${ENABLE_ANYTLS_TLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+                echo "请选择（默认 1，回车跳过）:"
+                read -r v
+                [ -z "${v:-}" ] && continue
+                for v in $v; do
+                    case "$v" in
+                        1) [ "${ENABLE_ANYTLS:-false}" = "true" ] && warn "AnyTLS Reality 已安装,跳过" || to_add="$to_add anytls-reality" ;;
+                        2) [ "${ENABLE_ANYTLS_TLS:-false}" = "true" ] && warn "AnyTLS TLS 已安装,跳过" || to_add="$to_add anytls-tls" ;;
+                        *) warn "无效选项: $v" ;;
+                    esac
+                done
+                ;;
             *) warn "无效选项: $n" ;;
         esac
     done
     [ -z "${to_add// /}" ] && { warn "没有可添加的协议"; return 1; }
 
-    local need_cert=false need_reality=false
-    for n in $to_add; do
-        [ "$n" = "2" ] || [ "$n" = "3" ] && need_cert=true
-        [ "$n" = "4" ] || [ "$n" = "5" ] && need_reality=true
+    local need_cert=false need_reality=false k
+    for k in $to_add; do
+        case "$k" in
+            hy2|tuic|vless-tls|anytls-tls) need_cert=true ;;
+            vless-reality|anytls-reality) need_reality=true ;;
+        esac
     done
 
     if $need_cert; then
@@ -1310,47 +1600,87 @@ action_add_protocol() {
     local one_file="/tmp/sb_new_one_$$.json"
     echo "[]" > "$new_inbounds_file"
 
-    local port method psk uuid m
-    for n in $to_add; do
-        case "$n" in
-            1)
+    local port method psk uuid m obfs_psk cc xpath
+    for k in $to_add; do
+        case "$k" in
+            ss)
                 port=$(ask_port "SS") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
-                read -p "SS 加密方式 1) 2022-blake3-aes-128-gcm(推荐) 2) aes-128-gcm [默认1]: " m
-                method="2022-blake3-aes-128-gcm"
-                [ "${m:-1}" = "2" ] && method="aes-128-gcm"
+                echo "SS 加密方式：1) 2022-blake3-aes-128-gcm(推荐) 2) 2022-blake3-aes-256-gcm 3) aes-128-gcm 4) aes-256-gcm 5) chacha20-ietf-poly1305 [默认1]:"
+                read -r m
+                case "${m:-1}" in
+                    1) method="2022-blake3-aes-128-gcm" ;;
+                    2) method="2022-blake3-aes-256-gcm" ;;
+                    3) method="aes-128-gcm" ;;
+                    4) method="aes-256-gcm" ;;
+                    5) method="chacha20-ietf-poly1305" ;;
+                    *) method="2022-blake3-aes-128-gcm" ;;
+                esac
                 psk=$(rand_pass)
                 SS_PORT="$port"; SS_PSK="$psk"; SS_METHOD="$method"
                 jq -n --argjson port "$port" --arg method "$method" --arg psk "$psk" \
                     '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:"ss-in"}' > "$one_file"
                 ;;
-            2)
+            hy2)
                 port=$(ask_port "HY2") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                echo "HY2 混淆：1) 无混淆（推荐） 2) salamander [默认1]:"
+                read -r m
                 psk=$(rand_pass)
                 HY2_PORT="$port"; HY2_PSK="$psk"
-                jq -n --argjson port "$port" --arg psk "$psk" \
-                    '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}],tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                if [ "${m:-1}" = "2" ]; then
+                    obfs_psk=$(rand_pass)
+                    HY2_OBFS="salamander"; HY2_OBFS_PSK="$obfs_psk"
+                    jq -n --argjson port "$port" --arg psk "$psk" --arg obfs_psk "$obfs_psk" \
+                        '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}],obfs:{type:"salamander",password:$obfs_psk},tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                else
+                    HY2_OBFS="none"; HY2_OBFS_PSK=""
+                    jq -n --argjson port "$port" --arg psk "$psk" \
+                        '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}],tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                fi
                 ;;
-            3)
+            tuic)
                 port=$(ask_port "TUIC") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                echo "TUIC 拥塞控制：1) bbr（推荐） 2) cubic 3) new_reno [默认1]:"
+                read -r m
+                case "${m:-1}" in
+                    1) cc="bbr" ;;
+                    2) cc="cubic" ;;
+                    3) cc="new_reno" ;;
+                    *) cc="bbr" ;;
+                esac
                 uuid=$(rand_uuid); psk=$(rand_pass)
-                TUIC_PORT="$port"; TUIC_UUID="$uuid"; TUIC_PSK="$psk"
-                jq -n --argjson port "$port" --arg uuid "$uuid" --arg psk "$psk" \
-                    '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                TUIC_PORT="$port"; TUIC_UUID="$uuid"; TUIC_PSK="$psk"; TUIC_CC="$cc"
+                jq -n --argjson port "$port" --arg uuid "$uuid" --arg psk "$psk" --arg cc "$cc" \
+                    '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:$cc,tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
                 ;;
-            4)
+            vless-reality)
                 port=$(ask_port "VLESS Reality") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
                 uuid=$(rand_uuid)
                 REALITY_PORT="$port"; REALITY_UUID="$uuid"
                 jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" \
                     '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}' > "$one_file"
                 ;;
-            5)
+            vless-tls)
+                port=$(ask_port "VLESS TLS") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                uuid=$(rand_uuid)
+                VLESS_TLS_PORT="$port"; VLESS_TLS_UUID="$uuid"
+                jq -n --argjson port "$port" --arg uuid "$uuid" \
+                    '{type:"vless",tag:"vless-tls-in",listen:"::",listen_port:$port,users:[{uuid:$uuid}],tls:{enabled:true,server_name:"www.bing.com",certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                ;;
+            anytls-reality)
                 port=$(ask_port "AnyTLS Reality") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
                 ANYTLS_PORT="$port"
                 ANYTLS_USER=$(openssl rand -hex 4)
                 ANYTLS_PSK=$(rand_pass)
                 jq -n --argjson port "$port" --arg user "$ANYTLS_USER" --arg psk "$ANYTLS_PSK" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" \
                     '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}' > "$one_file"
+                ;;
+            anytls-tls)
+                port=$(ask_port "AnyTLS TLS") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                ANYTLS_TLS_PORT="$port"
+                ANYTLS_TLS_USER=$(openssl rand -hex 4)
+                ANYTLS_TLS_PSK=$(rand_pass)
+                jq -n --argjson port "$port" --arg user "$ANYTLS_TLS_USER" --arg psk "$ANYTLS_TLS_PSK" \
+                    '{type:"anytls",tag:"anytls-tls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:"www.bing.com",certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
                 ;;
         esac
         if ! jq --slurpfile one "$one_file" '. + $one' "$new_inbounds_file" > "${new_inbounds_file}.tmp"; then
@@ -1373,27 +1703,31 @@ action_add_protocol() {
     mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
     # 更新协议开关（.protocols 与 .config_cache 都要改）
-    for n in $to_add; do
-        case "$n" in
-            1) ENABLE_SS=true ;;
-            2) ENABLE_HY2=true ;;
-            3) ENABLE_TUIC=true ;;
-            4) ENABLE_REALITY=true ;;
-            5) ENABLE_ANYTLS=true ;;
+    for k in $to_add; do
+        case "$k" in
+            ss) ENABLE_SS=true ;;
+            hy2) ENABLE_HY2=true ;;
+            tuic) ENABLE_TUIC=true ;;
+            vless-reality) ENABLE_REALITY=true ;;
+            vless-tls) ENABLE_VLESS_TLS=true ;;
+            anytls-reality) ENABLE_ANYTLS=true ;;
+            anytls-tls) ENABLE_ANYTLS_TLS=true ;;
         esac
     done
-    printf 'ENABLE_SS=%s\nENABLE_HY2=%s\nENABLE_TUIC=%s\nENABLE_REALITY=%s\nENABLE_ANYTLS=%s\n' \
-        "$ENABLE_SS" "$ENABLE_HY2" "$ENABLE_TUIC" "$ENABLE_REALITY" "$ENABLE_ANYTLS" > /etc/sing-box/.protocols
+    printf 'ENABLE_SS=%s\nENABLE_HY2=%s\nENABLE_TUIC=%s\nENABLE_REALITY=%s\nENABLE_ANYTLS=%s\nENABLE_VLESS_TLS=%s\nENABLE_ANYTLS_TLS=%s\n' \
+        "$ENABLE_SS" "$ENABLE_HY2" "$ENABLE_TUIC" "$ENABLE_REALITY" "$ENABLE_ANYTLS" "$ENABLE_VLESS_TLS" "$ENABLE_ANYTLS_TLS" > /etc/sing-box/.protocols
     update_cache_flags
 
     # 把新协议凭据追加进缓存（与安装脚本同一格式；链接实际以 config.json 为准）
-    for n in $to_add; do
-        case "$n" in
-            1) printf 'SS_PORT=%s\nSS_PSK=%s\nSS_METHOD=%s\n' "$SS_PORT" "$SS_PSK" "$SS_METHOD" >> "$CACHE_FILE" ;;
-            2) printf 'HY2_PORT=%s\nHY2_PSK=%s\n' "$HY2_PORT" "$HY2_PSK" >> "$CACHE_FILE" ;;
-            3) printf 'TUIC_PORT=%s\nTUIC_UUID=%s\nTUIC_PSK=%s\n' "$TUIC_PORT" "$TUIC_UUID" "$TUIC_PSK" >> "$CACHE_FILE" ;;
-            4) printf 'REALITY_PORT=%s\nREALITY_UUID=%s\nREALITY_PK=%s\nREALITY_SID=%s\nREALITY_PUB=%s\nREALITY_SNI=%s\n' "$REALITY_PORT" "$REALITY_UUID" "$REALITY_PK" "$REALITY_SID" "$REALITY_PUB" "$REALITY_SNI" >> "$CACHE_FILE" ;;
-            5) printf 'ANYTLS_PORT=%s\nANYTLS_USER=%s\nANYTLS_PSK=%s\n' "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PSK" >> "$CACHE_FILE" ;;
+    for k in $to_add; do
+        case "$k" in
+            ss) printf 'SS_PORT=%s\nSS_PSK=%s\nSS_METHOD=%s\n' "$SS_PORT" "$SS_PSK" "$SS_METHOD" >> "$CACHE_FILE" ;;
+            hy2) printf 'HY2_PORT=%s\nHY2_PSK=%s\nHY2_OBFS=%s\nHY2_OBFS_PSK=%s\n' "$HY2_PORT" "$HY2_PSK" "$HY2_OBFS" "$HY2_OBFS_PSK" >> "$CACHE_FILE" ;;
+            tuic) printf 'TUIC_PORT=%s\nTUIC_UUID=%s\nTUIC_PSK=%s\nTUIC_CC=%s\n' "$TUIC_PORT" "$TUIC_UUID" "$TUIC_PSK" "$TUIC_CC" >> "$CACHE_FILE" ;;
+            vless-reality) printf 'REALITY_PORT=%s\nREALITY_UUID=%s\nREALITY_PK=%s\nREALITY_SID=%s\nREALITY_PUB=%s\nREALITY_SNI=%s\n' "$REALITY_PORT" "$REALITY_UUID" "$REALITY_PK" "$REALITY_SID" "$REALITY_PUB" "$REALITY_SNI" >> "$CACHE_FILE" ;;
+            vless-tls) printf 'VLESS_TLS_PORT=%s\nVLESS_TLS_UUID=%s\n' "$VLESS_TLS_PORT" "$VLESS_TLS_UUID" >> "$CACHE_FILE" ;;
+            anytls-reality) printf 'ANYTLS_PORT=%s\nANYTLS_USER=%s\nANYTLS_PSK=%s\n' "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PSK" >> "$CACHE_FILE" ;;
+            anytls-tls) printf 'ANYTLS_TLS_PORT=%s\nANYTLS_TLS_USER=%s\nANYTLS_TLS_PSK=%s\n' "$ANYTLS_TLS_PORT" "$ANYTLS_TLS_USER" "$ANYTLS_TLS_PSK" >> "$CACHE_FILE" ;;
         esac
     done
 
@@ -1431,7 +1765,7 @@ action_reset_ss() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)
+    .inbounds |= map(if .tag=="ss-in" then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     
     info "已启动服务并更新 SS 端口: $new_port"
@@ -1458,7 +1792,7 @@ action_reset_hy2() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)
+    .inbounds |= map(if .tag=="hy2-in" then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     
     info "已启动服务并更新 HY2 端口: $new_port"
@@ -1485,7 +1819,7 @@ action_reset_tuic() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)
+    .inbounds |= map(if .tag=="tuic-in" then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     
     info "已启动服务并更新 TUIC 端口: $new_port"
@@ -1512,7 +1846,7 @@ action_reset_reality() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
     
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="vless" then .listen_port = $port else . end)
+    .inbounds |= map(if .tag=="vless-in" then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
     
     info "已启动服务并更新 Vless Reality 端口: $new_port"
@@ -1520,6 +1854,34 @@ action_reset_reality() {
     sleep 1
     generate_uris || warn "生成 URI 失败"
 }
+
+# 重置Vless TLS端口
+action_reset_vless_tls() {
+    read_config || return 1
+
+    if [ "${ENABLE_VLESS_TLS:-false}" != "true" ]; then
+        err "Vless TLS 协议未启用"
+        return 1
+    fi
+
+    read -p "输入新的 Vless TLS 端口(回车保持 $VLESS_TLS_PORT): " new_port
+    new_port="${new_port:-$VLESS_TLS_PORT}"
+
+    info "正在停止服务..."
+    service_stop || warn "停止服务失败"
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+
+    jq --argjson port "$new_port" '
+    .inbounds |= map(if .tag=="vless-tls-in" then .listen_port = $port else . end)
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    info "已启动服务并更新 Vless TLS 端口: $new_port"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
 
 # 重置AnyTLS Reality端口
 action_reset_anytls() {
@@ -1539,10 +1901,37 @@ action_reset_anytls() {
     cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
 
     jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="anytls" then .listen_port = $port else . end)
+    .inbounds |= map(if .tag=="anytls-in" then .listen_port = $port else . end)
     ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
 
     info "已启动服务并更新 AnyTLS Reality 端口: $new_port"
+    service_start || warn "启动服务失败"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+}
+
+# 重置AnyTLS TLS端口
+action_reset_anytls_tls() {
+    read_config || return 1
+
+    if [ "${ENABLE_ANYTLS_TLS:-false}" != "true" ]; then
+        err "AnyTLS TLS 协议未启用"
+        return 1
+    fi
+
+    read -p "输入新的 AnyTLS TLS 端口(回车保持 $ANYTLS_TLS_PORT): " new_port
+    new_port="${new_port:-$ANYTLS_TLS_PORT}"
+
+    info "正在停止服务..."
+    service_stop || warn "停止服务失败"
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+
+    jq --argjson port "$new_port" '
+    .inbounds |= map(if .tag=="anytls-tls-in" then .listen_port = $port else . end)
+    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    info "已启动服务并更新 AnyTLS TLS 端口: $new_port"
     service_start || warn "启动服务失败"
     sleep 1
     generate_uris || warn "生成 URI 失败"
@@ -1867,10 +2256,22 @@ MENU
         MENU_MAP[$option]="reset_reality"
         option=$((option + 1))
     fi
-    
+
+    if [ "${ENABLE_VLESS_TLS:-false}" = "true" ]; then
+        echo "$option) 重置 Vless TLS 端口"
+        MENU_MAP[$option]="reset_vless_tls"
+        option=$((option + 1))
+    fi
+
     if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
         echo "$option) 重置 AnyTLS Reality 端口"
         MENU_MAP[$option]="reset_anytls"
+        option=$((option + 1))
+    fi
+
+    if [ "${ENABLE_ANYTLS_TLS:-false}" = "true" ]; then
+        echo "$option) 重置 AnyTLS TLS 端口"
+        MENU_MAP[$option]="reset_anytls_tls"
         option=$((option + 1))
     fi
 
@@ -1932,7 +2333,9 @@ while true; do
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
                 reset_reality) action_reset_reality ;;
+                reset_vless_tls) action_reset_vless_tls ;;
                 reset_anytls) action_reset_anytls ;;
+                reset_anytls_tls) action_reset_anytls_tls ;;
                 start) service_start && info "已启动" ;;
                 stop) service_stop && info "已停止" ;;
                 restart) service_restart && info "已重启" ;;
