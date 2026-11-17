@@ -1476,6 +1476,12 @@ ensure_reality_keys() {
         info "复用已有 Reality 密钥对"
         return 0
     fi
+    # 配置里没有，再看缓存里是否留有上次的密钥对（卸载/切换后保留，复用可保持订阅链接不变）
+    if [ -n "${REALITY_PK:-}" ] && [ -n "${REALITY_PUB:-}" ] && [ -n "${REALITY_SID:-}" ]; then
+        REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+        info "复用缓存里的 Reality 密钥对"
+        return 0
+    fi
     if ! command -v sing-box >/dev/null 2>&1; then
         err "sing-box 未安装,无法生成 Reality 密钥"
         return 1
@@ -2211,6 +2217,473 @@ RELAY_EOF
 }
 
 # 动态生成菜单
+# -----------------------
+# 卸载 / 恢复 / 切换（新增）
+# 卸载时把整条入站（含端口、密码、UUID、Reality 密钥）备份到 $REMOVED_DIR，
+# 恢复时原样装回，凭据不变；切换变体时尽量保留端口与凭据。
+# -----------------------
+REMOVED_DIR="/etc/sing-box/.removed"
+
+# tag → .protocols 开关
+tag_to_flag() {
+    case "$1" in
+        ss-in) echo "ENABLE_SS" ;;
+        hy2-in) echo "ENABLE_HY2" ;;
+        tuic-in) echo "ENABLE_TUIC" ;;
+        vless-in) echo "ENABLE_REALITY" ;;
+        vless-tls-in) echo "ENABLE_VLESS_TLS" ;;
+        anytls-in) echo "ENABLE_ANYTLS" ;;
+        anytls-tls-in) echo "ENABLE_ANYTLS_TLS" ;;
+        *) echo "" ;;
+    esac
+}
+
+# tag → 显示名
+tag_to_name() {
+    case "$1" in
+        ss-in) echo "Shadowsocks (SS)" ;;
+        hy2-in) echo "Hysteria2 (HY2)" ;;
+        tuic-in) echo "TUIC" ;;
+        vless-in) echo "VLESS Reality" ;;
+        vless-tls-in) echo "VLESS TLS" ;;
+        anytls-in) echo "AnyTLS Reality" ;;
+        anytls-tls-in) echo "AnyTLS TLS" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# tag → 专属缓存键（空格分隔；Reality 共享密钥另行处理）
+tag_cache_keys() {
+    case "$1" in
+        ss-in) echo "SS_PORT SS_PSK SS_METHOD" ;;
+        hy2-in) echo "HY2_PORT HY2_PSK HY2_OBFS HY2_OBFS_PSK" ;;
+        tuic-in) echo "TUIC_PORT TUIC_UUID TUIC_PSK TUIC_CC" ;;
+        vless-in) echo "REALITY_PORT REALITY_UUID" ;;
+        vless-tls-in) echo "VLESS_TLS_PORT VLESS_TLS_UUID" ;;
+        anytls-in) echo "ANYTLS_PORT ANYTLS_USER ANYTLS_PSK" ;;
+        anytls-tls-in) echo "ANYTLS_TLS_PORT ANYTLS_TLS_USER ANYTLS_TLS_PSK" ;;
+        *) echo "" ;;
+    esac
+}
+
+# 已安装的 tag（每行一个）
+installed_tags() {
+    [ "${ENABLE_SS:-false}" = "true" ] && echo "ss-in"
+    [ "${ENABLE_HY2:-false}" = "true" ] && echo "hy2-in"
+    [ "${ENABLE_TUIC:-false}" = "true" ] && echo "tuic-in"
+    [ "${ENABLE_REALITY:-false}" = "true" ] && echo "vless-in"
+    [ "${ENABLE_VLESS_TLS:-false}" = "true" ] && echo "vless-tls-in"
+    [ "${ENABLE_ANYTLS:-false}" = "true" ] && echo "anytls-in"
+    [ "${ENABLE_ANYTLS_TLS:-false}" = "true" ] && echo "anytls-tls-in"
+}
+
+# tag 的监听端口
+tag_port() {
+    jq -r --arg t "$1" '.inbounds[] | select(.tag==$t) | .listen_port // empty' "$CONFIG_PATH" 2>/dev/null | head -n1
+}
+
+# 设置/删除缓存键（值里可能含 / = 等字符，用删行再追加，避免 sed 替换转义问题）
+set_cache_key() {
+    local k="$1" v="$2"
+    sed -i "/^${k}=/d" "$CACHE_FILE" 2>/dev/null
+    echo "${k}=${v}" >> "$CACHE_FILE"
+}
+del_cache_key() {
+    sed -i "/^${1}=/d" "$CACHE_FILE" 2>/dev/null
+}
+
+# 备份一条已安装的入站（配置 + 凭据）到 $REMOVED_DIR/<tag>.json
+backup_inbound() {
+    local tag="$1" name inbound_json cache_json keys k v ts
+    name=$(tag_to_name "$tag")
+    mkdir -p "$REMOVED_DIR"
+    inbound_json=$(jq -c --arg t "$tag" '.inbounds[] | select(.tag==$t)' "$CONFIG_PATH" 2>/dev/null)
+    [ -z "$inbound_json" ] || [ "$inbound_json" = "null" ] && { err "未找到入站: $tag"; return 1; }
+    cache_json="{}"
+    keys=$(tag_cache_keys "$tag")
+    for k in $keys; do
+        v=$(grep "^${k}=" "$CACHE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-)
+        [ -n "$v" ] && cache_json=$(echo "$cache_json" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+    done
+    # Reality 变体额外备份共享密钥（恢复时若已存在则值相同，覆盖无害）
+    case "$tag" in
+        vless-in|anytls-in)
+            for k in REALITY_PK REALITY_PUB REALITY_SID REALITY_SNI; do
+                v=$(grep "^${k}=" "$CACHE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-)
+                [ -n "$v" ] && cache_json=$(echo "$cache_json" | jq --arg k "$k" --arg v "$v" '. + {($k): $v}')
+            done
+            ;;
+    esac
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%d %H:%M")
+    jq -n --arg tag "$tag" --arg name "$name" --arg ts "$ts" --argjson inbound "$inbound_json" --argjson cache "$cache_json" \
+        '{tag:$tag, name:$name, removed_at:$ts, inbound:$inbound, cache:$cache}' > "$REMOVED_DIR/$tag.json" \
+        || { err "备份写入失败: $tag"; return 1; }
+    info "已备份 $name 到 $REMOVED_DIR/$tag.json"
+}
+
+# 卸载协议（备份凭据，之后可原样恢复）
+action_uninstall_protocol() {
+    read_config || return 1
+    if ! command -v jq >/dev/null 2>&1; then
+        err "缺少 jq,请先安装 jq"
+        return 1
+    fi
+    local tags_list
+    tags_list=$(installed_tags)
+    [ -z "$tags_list" ] && { warn "没有已安装的协议"; return 1; }
+    info "=== 卸载协议（会备份凭据，之后可原样恢复）==="
+    local i=1 tag name port
+    local -a arr
+    while IFS= read -r tag; do
+        [ -z "$tag" ] && continue
+        name=$(tag_to_name "$tag"); port=$(tag_port "$tag")
+        echo "$i) $name  [端口 $port]"
+        arr[$i]="$tag"
+        i=$((i+1))
+    done <<< "$tags_list"
+    echo "请选择要卸载的编号(多个用空格分隔，回车取消):"
+    read -r input
+    [ -z "${input:-}" ] && { info "已取消"; return 0; }
+    local to_remove="" n
+    for n in $input; do
+        tag="${arr[$n]:-}"
+        [ -z "$tag" ] && { warn "无效选项: $n"; continue; }
+        to_remove="$to_remove $tag"
+    done
+    [ -z "${to_remove// /}" ] && { warn "没有可卸载的协议"; return 1; }
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    info "已备份现有配置: ${CONFIG_PATH}.bak"
+    local flag keys k
+    for tag in $to_remove; do
+        name=$(tag_to_name "$tag")
+        backup_inbound "$tag" || { warn "备份 $name 失败，跳过"; continue; }
+        if ! jq --arg t "$tag" 'del(.inbounds[] | select(.tag==$t))' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"; then
+            err "删除 $name 失败"
+            cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+            return 1
+        fi
+        mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+        flag=$(tag_to_flag "$tag")
+        eval "$flag=false"
+        keys=$(tag_cache_keys "$tag")
+        for k in $keys; do
+            del_cache_key "$k"
+        done
+        # Reality 共享密钥对保留在缓存里不删：以后恢复/重装 Reality 变体时复用，订阅链接不变
+        info "已卸载 $name（凭据已备份）"
+    done
+    printf 'ENABLE_SS=%s\nENABLE_HY2=%s\nENABLE_TUIC=%s\nENABLE_REALITY=%s\nENABLE_ANYTLS=%s\nENABLE_VLESS_TLS=%s\nENABLE_ANYTLS_TLS=%s\n' \
+        "$ENABLE_SS" "$ENABLE_HY2" "$ENABLE_TUIC" "$ENABLE_REALITY" "$ENABLE_ANYTLS" "$ENABLE_VLESS_TLS" "$ENABLE_ANYTLS_TLS" > /etc/sing-box/.protocols
+    update_cache_flags
+    if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        err "配置校验失败，已恢复原配置"
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        return 1
+    fi
+    info "配置校验通过，正在重启服务..."
+    service_restart || warn "重启失败，请手动检查"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+    info "✅ 卸载完成。备份在 /etc/sing-box/.removed/，用菜单里的“恢复已卸载协议”可原样装回（端口、密码、密钥都不变）。"
+}
+
+# 恢复已卸载的协议（端口、密码、密钥原样恢复）
+action_restore_protocol() {
+    read_config || return 1
+    if ! command -v jq >/dev/null 2>&1; then
+        err "缺少 jq,请先安装 jq"
+        return 1
+    fi
+    mkdir -p "$REMOVED_DIR"
+    local files
+    files=$(ls "$REMOVED_DIR"/*.json 2>/dev/null)
+    [ -z "$files" ] && { warn "没有已卸载的协议备份（$REMOVED_DIR 为空）"; return 1; }
+    info "=== 恢复已卸载协议（端口、密码、密钥原样恢复）==="
+    local i=1 f tag name port removed_at
+    local -a arr
+    for f in $files; do
+        tag=$(jq -r '.tag // empty' "$f" 2>/dev/null)
+        name=$(jq -r '.name // empty' "$f" 2>/dev/null)
+        port=$(jq -r '.inbound.listen_port // empty' "$f" 2>/dev/null)
+        removed_at=$(jq -r '.removed_at // empty' "$f" 2>/dev/null)
+        [ -z "$tag" ] && continue
+        if jq -e --arg t "$tag" '.inbounds[] | select(.tag==$t)' "$CONFIG_PATH" >/dev/null 2>&1; then
+            echo "$i) $name  [已安装，跳过]"
+        else
+            echo "$i) $name  [端口 $port，卸载于 $removed_at]"
+        fi
+        arr[$i]="$tag"
+        i=$((i+1))
+    done
+    echo "请选择要恢复的编号(多个用空格分隔，回车取消):"
+    read -r input
+    [ -z "${input:-}" ] && { info "已取消"; return 0; }
+    local to_restore="" n
+    for n in $input; do
+        tag="${arr[$n]:-}"
+        [ -z "$tag" ] && { warn "无效选项: $n"; continue; }
+        to_restore="$to_restore $tag"
+    done
+    [ -z "${to_restore// /}" ] && { warn "没有可恢复的协议"; return 1; }
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    info "已备份现有配置: ${CONFIG_PATH}.bak"
+    local inbound new_port flag cache_keys k v
+    for tag in $to_restore; do
+        f="$REMOVED_DIR/$tag.json"
+        [ ! -f "$f" ] && { warn "备份不存在: $tag"; continue; }
+        if jq -e --arg t "$tag" '.inbounds[] | select(.tag==$t)' "$CONFIG_PATH" >/dev/null 2>&1; then
+            warn "$(tag_to_name "$tag") 已安装，跳过"
+            continue
+        fi
+        inbound=$(jq -c '.inbound' "$f")
+        port=$(echo "$inbound" | jq -r '.listen_port // empty')
+        # 端口被占则提示换端口
+        if jq -e --argjson p "$port" '.inbounds[] | select(.listen_port == $p)' "$CONFIG_PATH" >/dev/null 2>&1; then
+            warn "端口 $port 已被占用，请输入 $(tag_to_name "$tag") 的新端口（留空取消）:"
+            read -r new_port
+            [ -z "${new_port:-}" ] && { warn "已跳过 $(tag_to_name "$tag")"; continue; }
+            if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                warn "端口无效，跳过"
+                continue
+            fi
+            inbound=$(echo "$inbound" | jq --argjson p "$new_port" '.listen_port = $p')
+            port="$new_port"
+        fi
+        if ! jq --argjson ib "$inbound" '.inbounds += [$ib]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp"; then
+            err "恢复 $(tag_to_name "$tag") 失败"
+            cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+            return 1
+        fi
+        mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+        flag=$(tag_to_flag "$tag")
+        eval "$flag=true"
+        # 恢复缓存（端口若改了，同步改 *_PORT 键）
+        cache_keys=$(jq -r '.cache | keys[]' "$f" 2>/dev/null)
+        for k in $cache_keys; do
+            v=$(jq -r --arg k "$k" '.cache[$k] // empty' "$f")
+            case "$k" in
+                *_PORT) v="$port" ;;
+            esac
+            set_cache_key "$k" "$v"
+        done
+        rm -f "$f"
+        info "已恢复 $(tag_to_name "$tag")（端口 $port，凭据不变）"
+    done
+    printf 'ENABLE_SS=%s\nENABLE_HY2=%s\nENABLE_TUIC=%s\nENABLE_REALITY=%s\nENABLE_ANYTLS=%s\nENABLE_VLESS_TLS=%s\nENABLE_ANYTLS_TLS=%s\n' \
+        "$ENABLE_SS" "$ENABLE_HY2" "$ENABLE_TUIC" "$ENABLE_REALITY" "$ENABLE_ANYTLS" "$ENABLE_VLESS_TLS" "$ENABLE_ANYTLS_TLS" > /etc/sing-box/.protocols
+    update_cache_flags
+    if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        err "配置校验失败，已恢复原配置"
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        return 1
+    fi
+    info "配置校验通过，正在重启服务..."
+    service_restart || warn "重启失败，请手动检查"
+    sleep 1
+    generate_uris || warn "生成 URI 失败"
+    info "✅ 恢复完成。"
+}
+
+# 切换已安装节点的变体（保留端口与凭据；SS 换加密方式会重新生成密码）
+action_switch_variant() {
+    read_config || return 1
+    if ! command -v jq >/dev/null 2>&1; then
+        err "缺少 jq,请先安装 jq"
+        return 1
+    fi
+    info "=== 切换协议变体（端口、密码、密钥尽量保留）==="
+    local i=1
+    local -a arr kinds
+    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
+        echo "$i) VLESS Reality → VLESS TLS（端口 $(tag_port vless-in) 不变，UUID 不变）"
+        arr[$i]="vless-in"; kinds[$i]="vless-tls"; i=$((i+1))
+    fi
+    if [ "${ENABLE_VLESS_TLS:-false}" = "true" ]; then
+        echo "$i) VLESS TLS → VLESS Reality（端口 $(tag_port vless-tls-in) 不变，UUID 不变）"
+        arr[$i]="vless-tls-in"; kinds[$i]="vless-reality"; i=$((i+1))
+    fi
+    if [ "${ENABLE_ANYTLS:-false}" = "true" ]; then
+        echo "$i) AnyTLS Reality → AnyTLS TLS（端口 $(tag_port anytls-in) 不变，账号密码不变）"
+        arr[$i]="anytls-in"; kinds[$i]="anytls-tls"; i=$((i+1))
+    fi
+    if [ "${ENABLE_ANYTLS_TLS:-false}" = "true" ]; then
+        echo "$i) AnyTLS TLS → AnyTLS Reality（端口 $(tag_port anytls-tls-in) 不变，账号密码不变）"
+        arr[$i]="anytls-tls-in"; kinds[$i]="anytls-reality"; i=$((i+1))
+    fi
+    if [ "${ENABLE_HY2:-false}" = "true" ]; then
+        if [ "${HY2_OBFS:-none}" = "salamander" ]; then
+            echo "$i) HY2：去掉 salamander 混淆（端口、密码不变）"
+        else
+            echo "$i) HY2：加上 salamander 混淆（端口、密码不变）"
+        fi
+        arr[$i]="hy2-in"; kinds[$i]="hy2-obfs"; i=$((i+1))
+    fi
+    if [ "${ENABLE_TUIC:-false}" = "true" ]; then
+        echo "$i) TUIC：切换拥塞控制（当前 ${TUIC_CC:-bbr}，端口、账号不变）"
+        arr[$i]="tuic-in"; kinds[$i]="tuic-cc"; i=$((i+1))
+    fi
+    if [ "${ENABLE_SS:-false}" = "true" ]; then
+        echo "$i) SS：切换加密方式（当前 ${SS_METHOD}，端口不变，密码会重新生成）"
+        arr[$i]="ss-in"; kinds[$i]="ss-method"; i=$((i+1))
+    fi
+    [ "$i" = "1" ] && { warn "没有可切换的协议"; return 1; }
+    echo "请选择要切换的编号（回车取消）:"
+    read -r input
+    [ -z "${input:-}" ] && { info "已取消"; return 0; }
+    local from="${arr[$input]:-}" target="${kinds[$input]:-}"
+    [ -z "$from" ] && { warn "无效选项: $input"; return 1; }
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    info "已备份现有配置: ${CONFIG_PATH}.bak"
+
+    local port uuid user psk method cc obfs_psk new_inbound
+    case "$target" in
+        vless-tls)
+            ensure_cert || { cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            port=$(tag_port vless-in)
+            uuid=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .users[0].uuid // empty' "$CONFIG_PATH")
+            new_inbound=$(jq -n --argjson port "$port" --arg uuid "$uuid" \
+                '{type:"vless",tag:"vless-tls-in",listen:"::",listen_port:$port,users:[{uuid:$uuid}],tls:{enabled:true,server_name:"www.bing.com",certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+            jq --argjson ib "$new_inbound" 'del(.inbounds[] | select(.tag=="vless-in")) | .inbounds += [$ib]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+            ENABLE_REALITY=false; ENABLE_VLESS_TLS=true
+            del_cache_key REALITY_PORT; del_cache_key REALITY_UUID
+            # Reality 密钥对保留在缓存里，之后切回 Reality 时复用
+            set_cache_key VLESS_TLS_PORT "$port"
+            set_cache_key VLESS_TLS_UUID "$uuid"
+            info "已切换：VLESS Reality → VLESS TLS（端口 $port，UUID 不变）"
+            ;;
+        vless-reality)
+            ensure_reality_keys || { cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            port=$(tag_port vless-tls-in)
+            uuid=$(jq -r '.inbounds[] | select(.tag=="vless-tls-in") | .users[0].uuid // empty' "$CONFIG_PATH")
+            new_inbound=$(jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" \
+                '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+            jq --argjson ib "$new_inbound" 'del(.inbounds[] | select(.tag=="vless-tls-in")) | .inbounds += [$ib]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+            ENABLE_VLESS_TLS=false; ENABLE_REALITY=true
+            del_cache_key VLESS_TLS_PORT; del_cache_key VLESS_TLS_UUID
+            set_cache_key REALITY_PORT "$port"
+            set_cache_key REALITY_UUID "$uuid"
+            set_cache_key REALITY_PK "$REALITY_PK"
+            set_cache_key REALITY_SID "$REALITY_SID"
+            set_cache_key REALITY_PUB "$REALITY_PUB"
+            set_cache_key REALITY_SNI "$REALITY_SNI"
+            info "已切换：VLESS TLS → VLESS Reality（端口 $port，UUID 不变）"
+            ;;
+        anytls-tls)
+            ensure_cert || { cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            port=$(tag_port anytls-in)
+            user=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].name // empty' "$CONFIG_PATH")
+            psk=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].password // empty' "$CONFIG_PATH")
+            new_inbound=$(jq -n --argjson port "$port" --arg user "$user" --arg psk "$psk" \
+                '{type:"anytls",tag:"anytls-tls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:"www.bing.com",certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')
+            jq --argjson ib "$new_inbound" 'del(.inbounds[] | select(.tag=="anytls-in")) | .inbounds += [$ib]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+            ENABLE_ANYTLS=false; ENABLE_ANYTLS_TLS=true
+            del_cache_key ANYTLS_PORT; del_cache_key ANYTLS_USER; del_cache_key ANYTLS_PSK
+            # Reality 密钥对保留在缓存里，之后切回 Reality 时复用
+            set_cache_key ANYTLS_TLS_PORT "$port"
+            set_cache_key ANYTLS_TLS_USER "$user"
+            set_cache_key ANYTLS_TLS_PSK "$psk"
+            info "已切换：AnyTLS Reality → AnyTLS TLS（端口 $port，账号密码不变）"
+            ;;
+        anytls-reality)
+            ensure_reality_keys || { cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            port=$(tag_port anytls-tls-in)
+            user=$(jq -r '.inbounds[] | select(.tag=="anytls-tls-in") | .users[0].name // empty' "$CONFIG_PATH")
+            psk=$(jq -r '.inbounds[] | select(.tag=="anytls-tls-in") | .users[0].password // empty' "$CONFIG_PATH")
+            new_inbound=$(jq -n --argjson port "$port" --arg user "$user" --arg psk "$psk" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" \
+                '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')
+            jq --argjson ib "$new_inbound" 'del(.inbounds[] | select(.tag=="anytls-tls-in")) | .inbounds += [$ib]' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+            ENABLE_ANYTLS_TLS=false; ENABLE_ANYTLS=true
+            del_cache_key ANYTLS_TLS_PORT; del_cache_key ANYTLS_TLS_USER; del_cache_key ANYTLS_TLS_PSK
+            set_cache_key ANYTLS_PORT "$port"
+            set_cache_key ANYTLS_USER "$user"
+            set_cache_key ANYTLS_PSK "$psk"
+            set_cache_key REALITY_PK "$REALITY_PK"
+            set_cache_key REALITY_SID "$REALITY_SID"
+            set_cache_key REALITY_PUB "$REALITY_PUB"
+            set_cache_key REALITY_SNI "$REALITY_SNI"
+            info "已切换：AnyTLS TLS → AnyTLS Reality（端口 $port，账号密码不变）"
+            ;;
+        hy2-obfs)
+            if [ "${HY2_OBFS:-none}" = "salamander" ]; then
+                jq '(.inbounds[] | select(.tag=="hy2-in")) |= del(.obfs)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                    || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+                mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+                set_cache_key HY2_OBFS "none"
+                set_cache_key HY2_OBFS_PSK ""
+                info "已切换：HY2 去掉 salamander 混淆"
+            else
+                obfs_psk=$(rand_pass)
+                jq --arg obfs_psk "$obfs_psk" '(.inbounds[] | select(.tag=="hy2-in")) |= . + {obfs:{type:"salamander",password:$obfs_psk}}' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                    || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+                mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+                set_cache_key HY2_OBFS "salamander"
+                set_cache_key HY2_OBFS_PSK "$obfs_psk"
+                info "已切换：HY2 加上 salamander 混淆"
+            fi
+            ;;
+        tuic-cc)
+            echo "TUIC 拥塞控制：1) bbr 2) cubic 3) new_reno（当前 ${TUIC_CC:-bbr}）[默认1]:"
+            read -r m
+            case "${m:-1}" in
+                1) cc="bbr" ;;
+                2) cc="cubic" ;;
+                3) cc="new_reno" ;;
+                *) cc="bbr" ;;
+            esac
+            jq --arg cc "$cc" '(.inbounds[] | select(.tag=="tuic-in")) |= .congestion_control = $cc' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+            set_cache_key TUIC_CC "$cc"
+            info "已切换：TUIC 拥塞控制 → $cc"
+            ;;
+        ss-method)
+            echo "SS 加密方式：1) 2022-blake3-aes-128-gcm 2) 2022-blake3-aes-256-gcm 3) aes-128-gcm 4) aes-256-gcm 5) chacha20-ietf-poly1305（当前 ${SS_METHOD}）[默认1]:"
+            read -r m
+            case "${m:-1}" in
+                1) method="2022-blake3-aes-128-gcm" ;;
+                2) method="2022-blake3-aes-256-gcm" ;;
+                3) method="aes-128-gcm" ;;
+                4) method="aes-256-gcm" ;;
+                5) method="chacha20-ietf-poly1305" ;;
+                *) method="2022-blake3-aes-128-gcm" ;;
+            esac
+            psk=$(rand_pass)
+            jq --arg method "$method" --arg psk "$psk" '(.inbounds[] | select(.tag=="ss-in")) |= (.method = $method | .password = $psk)' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" \
+                || { err "切换失败"; cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"; return 1; }
+            mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+            set_cache_key SS_METHOD "$method"
+            set_cache_key SS_PSK "$psk"
+            info "已切换：SS 加密方式 → $method（密码已重新生成，客户端需用新链接）"
+            ;;
+        *)
+            err "未知切换目标: $target"
+            cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+            return 1
+            ;;
+    esac
+    printf 'ENABLE_SS=%s\nENABLE_HY2=%s\nENABLE_TUIC=%s\nENABLE_REALITY=%s\nENABLE_ANYTLS=%s\nENABLE_VLESS_TLS=%s\nENABLE_ANYTLS_TLS=%s\n' \
+        "$ENABLE_SS" "$ENABLE_HY2" "$ENABLE_TUIC" "$ENABLE_REALITY" "$ENABLE_ANYTLS" "$ENABLE_VLESS_TLS" "$ENABLE_ANYTLS_TLS" > /etc/sing-box/.protocols
+    update_cache_flags
+    if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        err "配置校验失败，已恢复原配置"
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        return 1
+    fi
+    info "配置校验通过，正在重启服务..."
+    service_restart || warn "重启失败，请手动检查"
+    sleep 1
+    action_view_uri || warn "生成 URI 失败"
+    info "✅ 切换完成。"
+}
+
 show_menu() {
     read_config 2>/dev/null || true
     
@@ -2231,6 +2704,23 @@ MENU
     # 添加新协议（固定选项）
     MENU_MAP[$option]="add_protocol"
     echo "$option) 添加新协议"
+    option=$((option + 1))
+
+    # 卸载协议（固定选项）
+    MENU_MAP[$option]="uninstall_protocol"
+    echo "$option) 卸载协议（备份凭据，可恢复）"
+    option=$((option + 1))
+
+    # 恢复已卸载协议（有备份时才显示）
+    if [ -n "$(ls /etc/sing-box/.removed/*.json 2>/dev/null)" ]; then
+        MENU_MAP[$option]="restore_protocol"
+        echo "$option) 恢复已卸载协议（凭据不变）"
+        option=$((option + 1))
+    fi
+
+    # 切换协议变体（固定选项）
+    MENU_MAP[$option]="switch_variant"
+    echo "$option) 切换协议变体（保留端口凭据）"
     option=$((option + 1))
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
@@ -2329,6 +2819,9 @@ while true; do
             action="${MENU_MAP[$opt]:-}"
             case "$action" in
                 add_protocol) action_add_protocol ;;
+                uninstall_protocol) action_uninstall_protocol ;;
+                restore_protocol) action_restore_protocol ;;
+                switch_variant) action_switch_variant ;;
                 reset_ss) action_reset_ss ;;
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
