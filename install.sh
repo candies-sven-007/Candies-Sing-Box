@@ -3,6 +3,7 @@
 # Candies Sing-box 多协议部署脚本
 # Author  : Candies-Sven
 # Repo    : https://github.com/candies-sven-007/proxy
+# 更新    : 管理面板新增“添加新协议”功能（2026-11-17，不重装、不动已有节点）
 # =============================================================
 set -euo pipefail
 
@@ -1171,6 +1172,247 @@ action_edit_config() {
     fi
 }
 
+# 询问端口（回车随机，校验范围、重复与系统占用）
+ask_port() {
+    local name="$1" input
+    while true; do
+        read -p "请输入 $name 端口(留空则随机 10000-60000): " input
+        input="${input:-$(rand_port)}"
+        if ! [[ "$input" =~ ^[0-9]+$ ]] || [ "$input" -lt 1 ] || [ "$input" -gt 65535 ]; then
+            warn "端口无效: $input,请输入 1-65535" >&2
+            continue
+        fi
+        if jq -e --argjson p "$input" '.inbounds[] | select(.listen_port == $p)' "$CONFIG_PATH" >/dev/null 2>&1; then
+            warn "端口 $input 已被现有节点占用,请换一个" >&2
+            continue
+        fi
+        if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ":${input} "; then
+            warn "端口 $input 已被系统其他服务占用,请换一个" >&2
+            continue
+        fi
+        echo "$input"
+        return 0
+    done
+}
+
+# HY2/TUIC 自签证书（没有就生成，已有就复用）
+ensure_cert() {
+    mkdir -p /etc/sing-box/certs
+    if [ ! -f /etc/sing-box/certs/fullchain.pem ] || [ ! -f /etc/sing-box/certs/privkey.pem ]; then
+        info "生成 HY2/TUIC 自签证书..."
+        openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout /etc/sing-box/certs/privkey.pem \
+          -out /etc/sing-box/certs/fullchain.pem \
+          -days 3650 \
+          -subj "/CN=www.bing.com" || { err "证书生成失败"; return 1; }
+        info "证书已生成"
+    else
+        info "证书已存在,复用"
+    fi
+}
+
+# Reality 密钥对（已有就复用，没有就生成）
+ensure_reality_keys() {
+    local existing_pk existing_sid sni_input keys
+    existing_pk=$(jq -r '.inbounds[] | select(.tls.reality.enabled == true) | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
+    if [ -n "$existing_pk" ]; then
+        REALITY_PK="$existing_pk"
+        REALITY_SID=$(jq -r '.inbounds[] | select(.tls.reality.enabled == true) | .tls.reality.short_id[0] // empty' "$CONFIG_PATH" | head -n1)
+        [ -f /etc/sing-box/.reality_pub ] && REALITY_PUB=$(cat /etc/sing-box/.reality_pub)
+        REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+        info "复用已有 Reality 密钥对"
+        return 0
+    fi
+    if ! command -v sing-box >/dev/null 2>&1; then
+        err "sing-box 未安装,无法生成 Reality 密钥"
+        return 1
+    fi
+    info "生成 Reality 密钥对..."
+    keys=$(sing-box generate reality-keypair 2>&1) || { err "生成 Reality 密钥失败"; return 1; }
+    REALITY_PK=$(echo "$keys" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r')
+    REALITY_PUB=$(echo "$keys" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r')
+    REALITY_SID=$(sing-box generate rand 8 --hex 2>&1) || { err "生成 Reality ShortID 失败"; return 1; }
+    if [ -z "$REALITY_PK" ] || [ -z "$REALITY_PUB" ] || [ -z "$REALITY_SID" ]; then
+        err "Reality 密钥生成结果为空"
+        return 1
+    fi
+    read -p "请输入 Reality 的 SNI(留空默认 addons.mozilla.org): " sni_input
+    REALITY_SNI="$(echo "${sni_input:-addons.mozilla.org}" | tr -d '[:space:]')"
+    mkdir -p /etc/sing-box
+    echo -n "$REALITY_PUB" > /etc/sing-box/.reality_pub
+    echo -n "$REALITY_SID" > /etc/sing-box/.reality_sid
+    info "Reality 密钥已生成"
+}
+
+# 更新 .config_cache 里的协议开关（read_config 先读 .protocols 再读缓存，两个都要改）
+update_cache_flags() {
+    local key val
+    for key in ENABLE_SS ENABLE_HY2 ENABLE_TUIC ENABLE_REALITY ENABLE_ANYTLS; do
+        val="${!key:-false}"
+        if grep -q "^${key}=" "$CACHE_FILE" 2>/dev/null; then
+            sed -i "s|^${key}=.*|${key}=${val}|" "$CACHE_FILE"
+        else
+            echo "${key}=${val}" >> "$CACHE_FILE"
+        fi
+    done
+}
+
+# 添加新协议（不重装、不动已有节点）
+action_add_protocol() {
+    read_config || return 1
+
+    if ! command -v jq >/dev/null 2>&1; then
+        err "缺少 jq,请先安装 jq"
+        return 1
+    fi
+
+    info "=== 添加新协议 ==="
+    echo "1) Shadowsocks (SS)   [ $([ "${ENABLE_SS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo "2) Hysteria2 (HY2)   [ $([ "${ENABLE_HY2:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo "3) TUIC              [ $([ "${ENABLE_TUIC:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo "4) VLESS Reality     [ $([ "${ENABLE_REALITY:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo "5) AnyTLS Reality    [ $([ "${ENABLE_ANYTLS:-false}" = "true" ] && echo 已安装 || echo 未安装) ]"
+    echo ""
+    echo "请输入要添加的协议编号(多个用空格分隔,如: 1 3,回车取消):"
+    read -r add_input
+    [ -z "${add_input:-}" ] && { info "已取消"; return 0; }
+
+    local to_add="" n
+    for n in $add_input; do
+        case "$n" in
+            1) [ "${ENABLE_SS:-false}" = "true" ] && warn "SS 已安装,跳过" || to_add="$to_add 1" ;;
+            2) [ "${ENABLE_HY2:-false}" = "true" ] && warn "HY2 已安装,跳过" || to_add="$to_add 2" ;;
+            3) [ "${ENABLE_TUIC:-false}" = "true" ] && warn "TUIC 已安装,跳过" || to_add="$to_add 3" ;;
+            4) [ "${ENABLE_REALITY:-false}" = "true" ] && warn "VLESS Reality 已安装,跳过" || to_add="$to_add 4" ;;
+            5) [ "${ENABLE_ANYTLS:-false}" = "true" ] && warn "AnyTLS Reality 已安装,跳过" || to_add="$to_add 5" ;;
+            *) warn "无效选项: $n" ;;
+        esac
+    done
+    [ -z "${to_add// /}" ] && { warn "没有可添加的协议"; return 1; }
+
+    local need_cert=false need_reality=false
+    for n in $to_add; do
+        [ "$n" = "2" ] || [ "$n" = "3" ] && need_cert=true
+        [ "$n" = "4" ] || [ "$n" = "5" ] && need_reality=true
+    done
+
+    if $need_cert; then
+        ensure_cert || return 1
+    fi
+    if $need_reality; then
+        ensure_reality_keys || return 1
+    fi
+
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    info "已备份现有配置: ${CONFIG_PATH}.bak"
+
+    local new_inbounds_file="/tmp/singbox_new_inbounds_$$.json"
+    local one_file="/tmp/sb_new_one_$$.json"
+    echo "[]" > "$new_inbounds_file"
+
+    local port method psk uuid m
+    for n in $to_add; do
+        case "$n" in
+            1)
+                port=$(ask_port "SS") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                read -p "SS 加密方式 1) 2022-blake3-aes-128-gcm(推荐) 2) aes-128-gcm [默认1]: " m
+                method="2022-blake3-aes-128-gcm"
+                [ "${m:-1}" = "2" ] && method="aes-128-gcm"
+                psk=$(rand_pass)
+                SS_PORT="$port"; SS_PSK="$psk"; SS_METHOD="$method"
+                jq -n --argjson port "$port" --arg method "$method" --arg psk "$psk" \
+                    '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$psk,tag:"ss-in"}' > "$one_file"
+                ;;
+            2)
+                port=$(ask_port "HY2") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                psk=$(rand_pass)
+                HY2_PORT="$port"; HY2_PSK="$psk"
+                jq -n --argjson port "$port" --arg psk "$psk" \
+                    '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,users:[{password:$psk}],tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                ;;
+            3)
+                port=$(ask_port "TUIC") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                uuid=$(rand_uuid); psk=$(rand_pass)
+                TUIC_PORT="$port"; TUIC_UUID="$uuid"; TUIC_PSK="$psk"
+                jq -n --argjson port "$port" --arg uuid "$uuid" --arg psk "$psk" \
+                    '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$psk}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}' > "$one_file"
+                ;;
+            4)
+                port=$(ask_port "VLESS Reality") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                uuid=$(rand_uuid)
+                REALITY_PORT="$port"; REALITY_UUID="$uuid"
+                jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" \
+                    '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}' > "$one_file"
+                ;;
+            5)
+                port=$(ask_port "AnyTLS Reality") || { rm -f "$new_inbounds_file" "$one_file"; return 1; }
+                ANYTLS_PORT="$port"
+                ANYTLS_USER=$(openssl rand -hex 4)
+                ANYTLS_PSK=$(rand_pass)
+                jq -n --argjson port "$port" --arg user "$ANYTLS_USER" --arg psk "$ANYTLS_PSK" --arg sni "$REALITY_SNI" --arg pk "$REALITY_PK" --arg sid "$REALITY_SID" \
+                    '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,users:[{name:$user,password:$psk}],padding_scheme:[],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}' > "$one_file"
+                ;;
+        esac
+        if ! jq --slurpfile one "$one_file" '. + $one' "$new_inbounds_file" > "${new_inbounds_file}.tmp"; then
+            err "生成入站配置失败"
+            rm -f "$new_inbounds_file" "${new_inbounds_file}.tmp" "$one_file"
+            return 1
+        fi
+        mv "${new_inbounds_file}.tmp" "$new_inbounds_file"
+    done
+    rm -f "$one_file"
+
+    # 把新入站追加进配置（已有入站原样保留）
+    # 注意：new_inbounds_file 本身已是 JSON 数组，不能用 --slurpfile（会再包一层数组），改用 -s
+    if ! jq -s '.[0].inbounds += .[1] | .[0]' "$CONFIG_PATH" "$new_inbounds_file" > "${CONFIG_PATH}.tmp"; then
+        err "写入配置失败,已恢复原配置"
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        rm -f "$new_inbounds_file" "${CONFIG_PATH}.tmp"
+        return 1
+    fi
+    mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+
+    # 更新协议开关（.protocols 与 .config_cache 都要改）
+    for n in $to_add; do
+        case "$n" in
+            1) ENABLE_SS=true ;;
+            2) ENABLE_HY2=true ;;
+            3) ENABLE_TUIC=true ;;
+            4) ENABLE_REALITY=true ;;
+            5) ENABLE_ANYTLS=true ;;
+        esac
+    done
+    printf 'ENABLE_SS=%s\nENABLE_HY2=%s\nENABLE_TUIC=%s\nENABLE_REALITY=%s\nENABLE_ANYTLS=%s\n' \
+        "$ENABLE_SS" "$ENABLE_HY2" "$ENABLE_TUIC" "$ENABLE_REALITY" "$ENABLE_ANYTLS" > /etc/sing-box/.protocols
+    update_cache_flags
+
+    # 把新协议凭据追加进缓存（与安装脚本同一格式；链接实际以 config.json 为准）
+    for n in $to_add; do
+        case "$n" in
+            1) printf 'SS_PORT=%s\nSS_PSK=%s\nSS_METHOD=%s\n' "$SS_PORT" "$SS_PSK" "$SS_METHOD" >> "$CACHE_FILE" ;;
+            2) printf 'HY2_PORT=%s\nHY2_PSK=%s\n' "$HY2_PORT" "$HY2_PSK" >> "$CACHE_FILE" ;;
+            3) printf 'TUIC_PORT=%s\nTUIC_UUID=%s\nTUIC_PSK=%s\n' "$TUIC_PORT" "$TUIC_UUID" "$TUIC_PSK" >> "$CACHE_FILE" ;;
+            4) printf 'REALITY_PORT=%s\nREALITY_UUID=%s\nREALITY_PK=%s\nREALITY_SID=%s\nREALITY_PUB=%s\nREALITY_SNI=%s\n' "$REALITY_PORT" "$REALITY_UUID" "$REALITY_PK" "$REALITY_SID" "$REALITY_PUB" "$REALITY_SNI" >> "$CACHE_FILE" ;;
+            5) printf 'ANYTLS_PORT=%s\nANYTLS_USER=%s\nANYTLS_PSK=%s\n' "$ANYTLS_PORT" "$ANYTLS_USER" "$ANYTLS_PSK" >> "$CACHE_FILE" ;;
+        esac
+    done
+
+    # 校验配置（失败则回滚）
+    if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        err "配置校验失败,已恢复原配置"
+        cp "${CONFIG_PATH}.bak" "$CONFIG_PATH"
+        rm -f "$new_inbounds_file"
+        return 1
+    fi
+    rm -f "$new_inbounds_file"
+
+    info "配置校验通过,正在重启服务..."
+    service_restart || warn "重启失败,请手动检查"
+    sleep 1
+    info "✅ 新协议已添加,链接如下:"
+    action_view_uri || warn "生成 URI 失败"
+}
+
 # 重置SS端口
 action_reset_ss() {
     read_config || return 1
@@ -1596,6 +1838,11 @@ MENU
     # 构建协议重置选项映射
     declare -g -A MENU_MAP
     local option=4
+
+    # 添加新协议（固定选项）
+    MENU_MAP[$option]="add_protocol"
+    echo "$option) 添加新协议"
+    option=$((option + 1))
     
     if [ "${ENABLE_SS:-false}" = "true" ]; then
         echo "$option) 重置 SS 端口"
@@ -1680,6 +1927,7 @@ while true; do
             # 处理动态选项
             action="${MENU_MAP[$opt]:-}"
             case "$action" in
+                add_protocol) action_add_protocol ;;
                 reset_ss) action_reset_ss ;;
                 reset_hy2) action_reset_hy2 ;;
                 reset_tuic) action_reset_tuic ;;
